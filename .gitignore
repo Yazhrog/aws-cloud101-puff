@@ -2,3 +2,4 @@ data/
 data-old-*
 .env
 app-src/
+.envrc.local
