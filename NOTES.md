@@ -83,3 +83,46 @@ Chaque décision est notée ici avec une ligne de justification. Ça devient le 
 - *VPC analytics + accès bureau* : peering ou Transit Gateway entre les VPC (CIDR qui ne se chevauchent pas), VPN site-à-site ou Direct Connect pour le bureau, et des SG qui n'ouvrent que les ports nécessaires.
 - *Facture NAT doublée* : regarder qui sort par le NAT. Des VPC endpoints pour S3/DynamoDB/ECR évitent de payer le NAT pour du trafic AWS. Un NAT par AZ coûte plus mais évite le trafic inter-AZ et le point de panne unique.
 - *Pourquoi l'ALB sur 2 AZ, et le point faible* : l'ALB exige 2 subnets dans 2 AZ pour survivre à la perte d'une zone. Le point faible reste l'unique conteneur : s'il meurt, plus rien derrière l'ALB (corrigé en M4 avec 2 tâches sur 2 AZ).
+
+## M3, secrets + supervision + moindre privilège
+- Sortie du check :
+  ```
+  PASS M3 secret g11/db-password exists
+  PASS M3 the running task gets the password from Secrets Manager
+  PASS M3 no password in clear in the task definition
+  PASS M3 an execution role, not admin
+  PASS M3 app logs land in CloudWatch (/ecs/g11-app)
+  PASS M3 an alarm pages the g11-alerts topic
+  PASS M3 the topic delivers to an SQS pager
+  PASS M3 a paged alarm saved in NOTES.md
+  PASS M3 deployer role without wildcard actions
+  PASS M3 deployer AccessDenied proof saved in NOTES.md
+  PASS M3 no password left in your current scripts
+  ```
+- Mot de passe : secret Secrets Manager `g11/db-password` (24 caractères aléatoires). La base `g11-db2` a été tournée sur cette valeur avec `modify-db-instance --apply-immediately`, donc l'ancien mot de passe en clair ne marche plus. `infra/deploy.sh` ne contient plus aucun mot de passe : il crée le secret puis le relit.
+- La tâche (révision 2 de `g11-app`) reçoit `DB_HOST` et `DB_PORT` en clair (de la config, pas des secrets) et `DB_PASSWORD` via `secrets.valueFrom` = ARN du secret. `describe-task-definition` ne montre que l'ARN.
+- Rôle d'exécution `g11-exec-role` : approuvé seulement par `ecs-tasks.amazonaws.com`, il peut lire ce seul secret et écrire des logs. Pas d'admin.
+- Logs : groupe `/ecs/g11-app`, préfixe `app`. Premier log : `Starting up on port 80`.
+- Pager : alarme `g11-errors` (somme de `g11/Errors` >= 1 sur 60 s) -> SNS `g11-alerts` -> SQS `g11-pager`. Test : `put-metric-data Errors=3`, page reçue dans la file :
+  ```
+  Subject: ALARM: "g11-errors"
+  NewStateValue: ALARM (avant : INSUFFICIENT_DATA)
+  NewStateReason: Threshold Crossed: 1 datapoint(s) breaching the threshold.
+  StateChangeTime: 2026-11-24T19:19:04.000+0000
+  ```
+
+## deployer proof
+- Le deployer ne peut pas supprimer la base : `AccessDenied` (rds:DeleteDBInstance), sortie complète ci-dessous.
+- Rôle `g11-deployer`, politique `deploy-only` : `ecs:DescribeServices`/`UpdateService` sur le seul service `g11/g11-app2`, enregistrer des task definitions, lire les logs, et `iam:PassRole` sur le seul rôle d'exécution. Aucune action en `*`.
+- `sts assume-role` -> `arn:aws:sts::000000000000:assumed-role/g11-deployer/thomas`. `update-service --desired-count 1` passe. Supprimer la base est refusé :
+  ```
+  $ aws rds delete-db-instance --db-instance-identifier g11-db2 --skip-final-snapshot
+  aws: [ERROR]: An error occurred (AccessDenied) when calling the DeleteDBInstance operation: User is not authorized to perform: rds:DeleteDBInstance
+  ```
+
+### À réfléchir
+- *Mot de passe passé en variable d'environnement* : quiconque peut lire la task definition (ou faire `docker inspect`) le voit, et il finit dans l'historique et dans git. Avec `secrets.valueFrom`, seuls le rôle d'exécution et les admins du secret le voient. Il reste visible dans l'environnement du conteneur en cours d'exécution, donc l'accès `ecs:ExecuteCommand` doit être limité aussi.
+- *SCP qui refuse `s3:DeleteBucket` sur Prod* : une SCP borne ce que le compte peut faire, même pour un admin. Même la clé admin qui a fuité ne peut pas supprimer les buckets. Elle ne donne aucun droit, elle n'en retire que.
+- *Conteneurs démarrés avec l'ancien mot de passe* : le secret est lu au démarrage de la tâche. Après une rotation, les tâches déjà lancées gardent l'ancienne valeur et échouent à la prochaine connexion. Il faut relancer (`--force-new-deployment`) ou utiliser une rotation à deux utilisateurs alternés.
+- *Snapshots copiés dans un compte séparé* : le chiffrement protège contre la lecture, pas contre la suppression. Si le compte prod est compromis, l'attaquant peut supprimer la base et ses snapshots. Une copie dans un compte de sauvegarde (avec sa propre clé KMS) survit.
+- *Alarme CPU à 3 h à cause du job de nuit* : c'est un faux positif qui apprend à ignorer le pager. Il faut alarmer sur ce qui touche les utilisateurs (erreurs 5xx, latence), ou exclure la fenêtre du job, ou demander plusieurs périodes d'évaluation.

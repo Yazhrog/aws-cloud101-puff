@@ -78,10 +78,15 @@ aws ecs create-service --cluster $GROUP --service-name $GROUP-app --task-definit
   --load-balancers targetGroupArn=$TG,containerName=app,containerPort=80 >/dev/null
 echo "App: http://$(aws elbv2 describe-load-balancers --names $GROUP-alb --query 'LoadBalancers[0].DNSName' --output text)/"
 
-# Database: public Postgres with a password in clear (sins 2 and 3)
+# Database: public Postgres (sin 2). The password was in clear here (sin 3) until M3:
+# it now lives in Secrets Manager, created first so no script ever types it.
+SECRET_ARN=$(aws secretsmanager create-secret --name $GROUP/db-password \
+  --secret-string "$(aws secretsmanager get-random-password --password-length 24 --exclude-punctuation --query RandomPassword --output text)" \
+  --query ARN --output text)
+db_password(){ aws secretsmanager get-secret-value --secret-id $GROUP/db-password --query SecretString --output text; }
 aws rds create-db-instance --db-instance-identifier $GROUP-db --engine postgres \
   --db-instance-class db.t3.micro --allocated-storage 20 \
-  --master-username app --master-user-password 'ChangeMe-123' --publicly-accessible >/dev/null
+  --master-username app --master-user-password "$(db_password)" --publicly-accessible >/dev/null
 
 # Status page: static website on the group bucket, readable by anyone
 echo "<h1>$GROUP is up</h1>" > /tmp/$GROUP-index.html
@@ -143,12 +148,12 @@ aws ecs create-service --cluster $GROUP --service-name $GROUP-app2 --task-defini
   --network-configuration "awsvpcConfiguration={subnets=[$PRIV_A,$PRIV_B],securityGroups=[$APP_SG2],assignPublicIp=DISABLED}" \
   --load-balancers targetGroupArn=$TG2,containerName=app,containerPort=80 >/dev/null
 
-# DB moves in: private subnets, not public (password rotated in M3)
+# DB moves in: private subnets, not public, password from Secrets Manager
 aws rds create-db-subnet-group --db-subnet-group-name $GROUP-db-subnets \
   --db-subnet-group-description "private subnets" --subnet-ids $PRIV_A $PRIV_B >/dev/null
 aws rds create-db-instance --db-instance-identifier $GROUP-db2 --engine postgres \
   --db-instance-class db.t3.micro --allocated-storage 20 \
-  --master-username app --master-user-password 'ChangeMe-123' \
+  --master-username app --master-user-password "$(db_password)" \
   --vpc-security-group-ids $DB_SG2 --db-subnet-group-name $GROUP-db-subnets --no-publicly-accessible >/dev/null
 echo "App: http://$(aws elbv2 describe-load-balancers --names $GROUP-alb2 --query 'LoadBalancers[0].DNSName' --output text)/"
 
@@ -163,3 +168,62 @@ aws ec2 delete-security-group --group-id $ALB_SG
 aws ec2 delete-security-group --group-id $APP_SG
 
 # Proof, run by hand: ./checks/intruder.sh  ->  app BLOCKED (see NOTES.md, M2)
+
+# ---------- M3, secrets + monitoring + least privilege ----------
+
+# The secret $GROUP/db-password exists since the M1 DB step. Rotation: the DB gets
+# the secret's value, so the old hard-coded password no longer works anywhere.
+aws rds modify-db-instance --db-instance-identifier $GROUP-db2 --apply-immediately \
+  --master-user-password "$(db_password)" >/dev/null
+
+# Execution role: ECS may read this one secret and write logs, nothing else
+EXEC_ROLE=$(aws iam create-role --role-name $GROUP-exec-role --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+}' --query Role.Arn --output text)
+aws iam put-role-policy --role-name $GROUP-exec-role --policy-name read-secret-write-logs --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": \"secretsmanager:GetSecretValue\", \"Resource\": \"$SECRET_ARN\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\"], \"Resource\": \"*\"}]}"
+
+# Logs + task revision 2: DB host/port as plain config, the password injected from the secret
+aws logs create-log-group --log-group-name /ecs/$GROUP-app
+read DB_HOST DB_PORT < <(aws rds describe-db-instances --db-instance-identifier $GROUP-db2 \
+  --query 'DBInstances[0].Endpoint.[Address,Port]' --output text)
+aws ecs register-task-definition --family $GROUP-app --network-mode awsvpc \
+  --requires-compatibilities FARGATE --cpu 256 --memory 512 --execution-role-arn $EXEC_ROLE \
+  --container-definitions "[{
+    \"name\": \"app\", \"image\": \"$REGISTRY/$GROUP-app:v1\", \"essential\": true,
+    \"portMappings\": [{\"containerPort\": 80}],
+    \"environment\": [{\"name\": \"DB_HOST\", \"value\": \"$DB_HOST\"}, {\"name\": \"DB_PORT\", \"value\": \"$DB_PORT\"}],
+    \"secrets\": [{\"name\": \"DB_PASSWORD\", \"valueFrom\": \"$SECRET_ARN\"}],
+    \"logConfiguration\": {\"logDriver\": \"awslogs\", \"options\": {
+      \"awslogs-group\": \"/ecs/$GROUP-app\", \"awslogs-region\": \"us-east-1\", \"awslogs-stream-prefix\": \"app\"}}}]" >/dev/null
+aws ecs update-service --cluster $GROUP --service $GROUP-app2 --task-definition $GROUP-app >/dev/null
+
+# Pager: alarm -> SNS topic -> SQS queue (Floci sends no email)
+TOPIC=$(aws sns create-topic --name $GROUP-alerts --query TopicArn --output text)
+PAGER=$(aws sqs create-queue --queue-name $GROUP-pager --query QueueUrl --output text)
+PAGER_ARN=$(aws sqs get-queue-attributes --queue-url $PAGER --attribute-names QueueArn --query Attributes.QueueArn --output text)
+aws sns subscribe --topic-arn $TOPIC --protocol sqs --notification-endpoint $PAGER_ARN >/dev/null
+aws cloudwatch put-metric-alarm --alarm-name $GROUP-errors --namespace $GROUP --metric-name Errors \
+  --statistic Sum --period 60 --evaluation-periods 1 --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold --alarm-actions $TOPIC
+# Test, by hand: put-metric-data Errors=3, then sqs receive-message on $PAGER (see NOTES.md, M3)
+
+# Deployer role: can roll the app service and read its logs, nothing else
+aws iam create-role --role-name $GROUP-deployer --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"}, "Action": "sts:AssumeRole"}]
+}' >/dev/null
+aws iam put-role-policy --role-name $GROUP-deployer --policy-name deploy-only --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:DescribeServices\", \"ecs:UpdateService\"],
+     \"Resource\": \"arn:aws:ecs:us-east-1:000000000000:service/$GROUP/$GROUP-app2\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:RegisterTaskDefinition\", \"ecs:DescribeTaskDefinition\",
+       \"logs:GetLogEvents\", \"logs:FilterLogEvents\", \"logs:DescribeLogStreams\"], \"Resource\": \"*\"},
+    {\"Effect\": \"Allow\", \"Action\": \"iam:PassRole\", \"Resource\": \"$EXEC_ROLE\"}]}"
+# Proof, by hand: sts assume-role as the deployer, update-service works,
+# rds delete-db-instance is AccessDenied (see NOTES.md, deployer proof)
