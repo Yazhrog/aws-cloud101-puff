@@ -96,3 +96,70 @@ echo "Status: http://$GROUP-site.s3-website-us-east-1.localhost:4566/"
 
 # The VM way (step 7) was a one-off demo: run-instances + user data serving :8080,
 # checked with docker exec, then terminated. Not part of the platform.
+
+# ---------- M2, private network ----------
+
+# VPC 10.0.0.0/16: 2 public subnets (ALB) + 2 private subnets (app, DB), in 2 AZs
+VPC2=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=$GROUP-vpc}]" --query Vpc.VpcId --output text)
+sub(){ aws ec2 create-subnet --vpc-id $VPC2 --cidr-block $1 --availability-zone $2 \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$GROUP-$3}]" --query Subnet.SubnetId --output text; }
+PUB_A=$(sub 10.0.1.0/24 us-east-1a pub-a);    PUB_B=$(sub 10.0.2.0/24 us-east-1b pub-b)
+PRIV_A=$(sub 10.0.11.0/24 us-east-1a priv-a); PRIV_B=$(sub 10.0.12.0/24 us-east-1b priv-b)
+
+# Doors: public subnets route to the internet gateway, private ones go out through a NAT
+# (Floci: these exist in the API but route nothing, real AWS needs them)
+IGW=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC2
+PUB_RT=$(aws ec2 create-route-table --vpc-id $VPC2 --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $PUB_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW >/dev/null
+for s in $PUB_A $PUB_B; do aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $s >/dev/null; done
+EIP=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+NAT=$(aws ec2 create-nat-gateway --subnet-id $PUB_A --allocation-id $EIP --query NatGateway.NatGatewayId --output text)
+PRIV_RT=$(aws ec2 create-route-table --vpc-id $VPC2 --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $PRIV_RT --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT >/dev/null
+for s in $PRIV_A $PRIV_B; do aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $s >/dev/null; done
+
+# Security-group chain: internet -> ALB:80 -> app:80 -> DB:5432
+ALB_SG2=$(aws ec2 create-security-group --group-name $GROUP-alb-sg2 --description "ALB: 80 from the internet" --vpc-id $VPC2 --query GroupId --output text)
+APP_SG2=$(aws ec2 create-security-group --group-name $GROUP-app-sg2 --description "App: 80 from the load balancer only" --vpc-id $VPC2 --query GroupId --output text)
+DB_SG2=$(aws ec2 create-security-group --group-name $GROUP-db-sg2 --description "DB: 5432 from the app only" --vpc-id $VPC2 --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG2 --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null
+# Floci's ALB is not a container, it sits on the Docker bridge. Real AWS: --source-group $ALB_SG2
+aws ec2 authorize-security-group-ingress --group-id $APP_SG2 --protocol tcp --port 80 --cidr 172.17.0.0/16 >/dev/null
+aws ec2 authorize-security-group-ingress --group-id $DB_SG2 --protocol tcp --port 5432 --source-group $APP_SG2 >/dev/null
+
+# The only public door: ALB in the public subnets
+ALB2=$(aws elbv2 create-load-balancer --name $GROUP-alb2 --subnets $PUB_A $PUB_B --security-groups $ALB_SG2 \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+TG2=$(aws elbv2 create-target-group --name $GROUP-tg2 --protocol HTTP --port 80 --vpc-id $VPC2 \
+  --target-type ip --health-check-path / --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws elbv2 create-listener --load-balancer-arn $ALB2 --protocol HTTP --port 80 \
+  --default-actions Type=forward,TargetGroupArn=$TG2 >/dev/null
+
+# App moves in: private subnets, no public IP
+aws ecs create-service --cluster $GROUP --service-name $GROUP-app2 --task-definition $GROUP-app \
+  --desired-count 1 --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$PRIV_A,$PRIV_B],securityGroups=[$APP_SG2],assignPublicIp=DISABLED}" \
+  --load-balancers targetGroupArn=$TG2,containerName=app,containerPort=80 >/dev/null
+
+# DB moves in: private subnets, not public (password rotated in M3)
+aws rds create-db-subnet-group --db-subnet-group-name $GROUP-db-subnets \
+  --db-subnet-group-description "private subnets" --subnet-ids $PRIV_A $PRIV_B >/dev/null
+aws rds create-db-instance --db-instance-identifier $GROUP-db2 --engine postgres \
+  --db-instance-class db.t3.micro --allocated-storage 20 \
+  --master-username app --master-user-password 'ChangeMe-123' \
+  --vpc-security-group-ids $DB_SG2 --db-subnet-group-name $GROUP-db-subnets --no-publicly-accessible >/dev/null
+echo "App: http://$(aws elbv2 describe-load-balancers --names $GROUP-alb2 --query 'LoadBalancers[0].DNSName' --output text)/"
+
+# Tear down the naive M1 deploy (service, ALB, target group, public DB, open SGs)
+aws ecs update-service --cluster $GROUP --service $GROUP-app --desired-count 0 >/dev/null
+aws ecs delete-service --cluster $GROUP --service $GROUP-app >/dev/null
+aws elbv2 delete-listener --listener-arn $(aws elbv2 describe-listeners --load-balancer-arn $ALB --query 'Listeners[0].ListenerArn' --output text)
+aws elbv2 delete-load-balancer --load-balancer-arn $ALB
+aws elbv2 delete-target-group --target-group-arn $TG
+aws rds delete-db-instance --db-instance-identifier $GROUP-db --skip-final-snapshot >/dev/null
+aws ec2 delete-security-group --group-id $ALB_SG
+aws ec2 delete-security-group --group-id $APP_SG
+
+# Proof, run by hand: ./checks/intruder.sh  ->  app BLOCKED (see NOTES.md, M2)

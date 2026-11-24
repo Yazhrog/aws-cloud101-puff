@@ -46,3 +46,40 @@ Chaque décision est notée ici avec une ligne de justification. Ça devient le 
 | Un seul conteneur à un seul endroit | il meurt ou l'AZ tombe = site down | 2+ tâches sur 2 AZ + autoscaling (M4) |
 | Pas de CDN ni de HTTPS | trafic en clair, page de statut servie depuis un seul point | CloudFront (+ ACM pour HTTPS) (M4) |
 | Tout tapé à la main | impossible à reconstruire à l'identique, dérive | CloudFormation, rebuild en une commande (M5) |
+
+## M2, réseau privé
+- Sortie du check :
+  ```
+  PASS M2 VPC g11-vpc exists
+  PASS M2 2 public subnets (route to IGW)
+  PASS M2 2 private subnets (route to NAT)
+  PASS M2 ALB in the public subnets
+  PASS M2 ALB answers 200
+  PASS M2 app service in the private subnets
+  PASS M2 app tasks without public IP
+  PASS M2 app security group not open to 0.0.0.0/0
+  PASS M2 database in the VPC, not public
+  PASS M2 database only reachable from the app's group
+  PASS M2 intruder blocked from the app
+  PASS M2 naive deploy deleted (no public DB, no service outside the VPC)
+  ```
+- Intruder (`./checks/intruder.sh`) :
+  ```
+  intruder -> app 172.17.0.8:80        : BLOCKED
+  intruder -> db  172.17.0.2:7002 : REACHED
+  ```
+  Le `REACHED` côté base est une limite de Floci (son proxy RDS ignore les security groups). La règle est juste : le SG `g11-db-sg2` n'accepte le 5432 que depuis le SG de l'app.
+- VPC `g11-vpc` 10.0.0.0/16 : publics 10.0.1.0/24 (1a) et 10.0.2.0/24 (1b) pour l'ALB, privés 10.0.11.0/24 (1a) et 10.0.12.0/24 (1b) pour l'app et la base. Deux AZ pour que l'ALB survive à la perte d'une zone.
+- Une seule porte publique : l'ALB `g11-alb2`. L'app n'a pas d'IP publique et sort par le NAT, la base n'est pas publique.
+- Chaîne de SG : internet -> ALB:80 -> app:80 -> base:5432. Chaque couche n'accepte que la couche d'avant. Sur Floci l'app autorise 172.17.0.0/16 (le bridge Docker où vit l'ALB) ; sur AWS ce serait `--source-group` du SG de l'ALB.
+- Exercice de panne :
+  - Panne B (retirer la règle 172.17.0.0/16 + force-new-deployment) : le site est resté à 200, car l'ancienne tâche reste en place tant que la nouvelle n'est pas saine, et les connexions établies continuent. On a remis la règle.
+  - Panne C (desired-count 0) : l'ALB répond `503 No targets available`. Réparé avec desired-count 1, 200 au bout de 8 s.
+- Le déploiement naïf de M1 est supprimé : service `g11-app`, `g11-alb`, `g11-tg`, la base publique `g11-db` et les SG ouverts du VPC par défaut.
+
+### À réfléchir
+- *L'app privée n'arrive pas à joindre la base* : vérifier dans l'ordre le SG de la base (5432 depuis le SG de l'app ?), le SG de l'app en sortie, que la base et l'app sont dans le même VPC, l'endpoint et le port utilisés, puis le NACL des subnets.
+- *Sauter le NAT et donner une IP publique à l'app* : ça marche, mais chaque tâche devient joignable depuis internet dès qu'un SG est trop large. Le NAT ne laisse que les connexions sortantes.
+- *VPC analytics + accès bureau* : peering ou Transit Gateway entre les VPC (CIDR qui ne se chevauchent pas), VPN site-à-site ou Direct Connect pour le bureau, et des SG qui n'ouvrent que les ports nécessaires.
+- *Facture NAT doublée* : regarder qui sort par le NAT. Des VPC endpoints pour S3/DynamoDB/ECR évitent de payer le NAT pour du trafic AWS. Un NAT par AZ coûte plus mais évite le trafic inter-AZ et le point de panne unique.
+- *Pourquoi l'ALB sur 2 AZ, et le point faible* : l'ALB exige 2 subnets dans 2 AZ pour survivre à la perte d'une zone. Le point faible reste l'unique conteneur : s'il meurt, plus rien derrière l'ALB (corrigé en M4 avec 2 tâches sur 2 AZ).
