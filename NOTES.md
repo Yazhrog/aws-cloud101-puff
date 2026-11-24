@@ -1,6 +1,6 @@
 # Notes du groupe
 
-Groupe : g11 · Membres : thomas.polverelli, X, X · App : <URL git de l'app déployée>
+Groupe : g11 · Membres : thomas.polverelli (solo) · App : <URL git de l'app déployée>
 
 Chaque décision est notée ici avec une ligne de justification. Ça devient le pitch de la soutenance.
 

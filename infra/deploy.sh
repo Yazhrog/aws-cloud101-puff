@@ -7,8 +7,8 @@ cd "$(dirname "$0")/.." && . ./env.sh
 
 # ---------- M0, setup + IAM ----------
 
-# One IAM user per member (replace member2/member3 with your teammates' names)
-MEMBERS="thomas member2 member3"
+# One IAM user per member (solo project: just me)
+MEMBERS="thomas"
 for u in $MEMBERS; do
   aws iam create-user --user-name $GROUP-$u >/dev/null
 done
