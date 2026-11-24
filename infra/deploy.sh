@@ -227,3 +227,39 @@ aws iam put-role-policy --role-name $GROUP-deployer --policy-name deploy-only --
     {\"Effect\": \"Allow\", \"Action\": \"iam:PassRole\", \"Resource\": \"$EXEC_ROLE\"}]}"
 # Proof, by hand: sts assume-role as the deployer, update-service works,
 # rds delete-db-instance is AccessDenied (see NOTES.md, deployer proof)
+
+# ---------- M4, scale + survive + CDN ----------
+
+# Two containers; the service's private subnets are in 2 AZs
+aws ecs update-service --cluster $GROUP --service $GROUP-app2 --desired-count 2 >/dev/null
+
+# Our own autoscaler: alarm -> SNS -> Lambda that moves desiredCount by 1, clamped to [2, 4]
+python3 -m zipfile -c /tmp/$GROUP-scaler.zip infra/scaler.py
+aws iam create-role --role-name $GROUP-scaler-role --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"Service": ["lambda.amazonaws.com", "scheduler.amazonaws.com"]}, "Action": "sts:AssumeRole"}]
+}' >/dev/null
+aws iam put-role-policy --role-name $GROUP-scaler-role --policy-name scale-one-service --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": [\"ecs:DescribeServices\", \"ecs:UpdateService\"],
+     \"Resource\": \"arn:aws:ecs:us-east-1:000000000000:service/$GROUP/$GROUP-app2\"},
+    {\"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\",
+       \"lambda:InvokeFunction\"], \"Resource\": \"*\"}]}"
+SCALER=$(aws lambda create-function --function-name $GROUP-scaler --runtime python3.12 --handler scaler.handler \
+  --zip-file fileb:///tmp/$GROUP-scaler.zip --role arn:aws:iam::000000000000:role/$GROUP-scaler-role \
+  --environment "Variables={CLUSTER=$GROUP,SERVICE=$GROUP-app2,MIN=2,MAX=4}" --query FunctionArn --output text)
+SCALE_TOPIC=$(aws sns create-topic --name $GROUP-scale --query TopicArn --output text)
+aws sns subscribe --topic-arn $SCALE_TOPIC --protocol lambda --notification-endpoint $SCALER >/dev/null
+aws lambda add-permission --function-name $GROUP-scaler --statement-id from-sns --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com --source-arn $SCALE_TOPIC >/dev/null
+# Floci has no CPU metric: the app's load is a custom metric $GROUP/Load. OK scales back in.
+aws cloudwatch put-metric-alarm --alarm-name $GROUP-load-high --namespace $GROUP --metric-name Load \
+  --statistic Average --period 60 --evaluation-periods 1 --threshold 70 \
+  --comparison-operator GreaterThanThreshold --alarm-actions $SCALE_TOPIC --ok-actions $SCALE_TOPIC
+# Load test, by hand: put-metric-data Load=95 (2 -> 3), then Load=10 (3 -> 2), see NOTES.md
+
+# CloudFront in front of the status page
+CF_ID=$(aws cloudfront create-distribution --origin-domain-name $GROUP-site.s3.amazonaws.com \
+  --default-root-object index.html --query Distribution.Id --output text)
+echo "Status via CDN: http://$CF_ID.cloudfront.localhost.floci.io:4566/"

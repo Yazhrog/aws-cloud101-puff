@@ -126,3 +126,34 @@ Chaque décision est notée ici avec une ligne de justification. Ça devient le 
 - *Conteneurs démarrés avec l'ancien mot de passe* : le secret est lu au démarrage de la tâche. Après une rotation, les tâches déjà lancées gardent l'ancienne valeur et échouent à la prochaine connexion. Il faut relancer (`--force-new-deployment`) ou utiliser une rotation à deux utilisateurs alternés.
 - *Snapshots copiés dans un compte séparé* : le chiffrement protège contre la lecture, pas contre la suppression. Si le compte prod est compromis, l'attaquant peut supprimer la base et ses snapshots. Une copie dans un compte de sauvegarde (avec sa propre clé KMS) survit.
 - *Alarme CPU à 3 h à cause du job de nuit* : c'est un faux positif qui apprend à ignorer le pager. Il faut alarmer sur ce qui touche les utilisateurs (erreurs 5xx, latence), ou exclure la fenêtre du job, ou demander plusieurs périodes d'évaluation.
+
+## M4, passer à l'échelle + survivre
+- Sortie du check (avant l'idée) :
+  ```
+  PASS M4 at least 2 containers running (2)
+  PASS M4 the service spans 2 Availability Zones
+  PASS M4 the load balancer answers 200
+  PASS M4 your autoscaler function exists
+  PASS M4 its role can scale your service only
+  PASS M4 an alarm calls your autoscaler
+  PASS M4 your autoscaler scaled out
+  PASS M4 your autoscaler scaled back in
+  PASS M4 CloudFront serves your status page
+  FAIL M4 your idea is designed in NOTES.md
+  ```
+- 2 conteneurs derrière `g11-alb2` : sur 8 requêtes, 4 sur `a6890606919c` et 4 sur `cd022f00ed1b`. Le service est sur les subnets privés de us-east-1a et us-east-1b. Sur Floci les deux tâches ont atterri en 1a : la répartition entre AZ est faite au mieux par ECS, pas garantie.
+- Kill drill : `docker rm -f` d'une des deux tâches. Pendant l'arrêt on a eu 2 réponses 502 (t+1 s et t+7 s, l'ALB envoyait encore vers la tâche morte), puis seulement des 200. ECS a remplacé la tâche tout seul (desired 2 / running 2) en environ 30 s. Avec une seule tâche, le site aurait été coupé pendant tout ce temps.
+- Autoscaler maison : alarme `g11-load-high` (moyenne de `g11/Load` > 70 sur 60 s) -> SNS `g11-scale` -> Lambda `g11-scaler` (Python 3.12, `infra/scaler.py`). ALARM = +1, OK = -1, borné à [2, 4]. Son rôle `g11-scaler-role` ne peut toucher que le service `g11/g11-app2`. Floci ne publie pas de CPU, d'où une métrique `Load` à nous.
+- Test de charge (logs de `/aws/lambda/g11-scaler`) :
+  ```
+  Load=95 -> g11-app2: 2 -> 3
+  Load=10 -> g11-app2: 3 -> 2
+  ```
+- CloudFront devant la page de statut : origine `g11-site.s3.amazonaws.com`, objet racine `index.html`, statut `Deployed`, répond `<h1>g11 is up</h1>` sur `http://<id>.cloudfront.localhost.floci.io:4566/`.
+
+### À réfléchir
+- *Une AZ tombe alors que la base est mono-AZ* : les tâches de l'autre AZ survivent, mais si c'est l'AZ de la base, l'app entière est down. RDS Multi-AZ (standby synchrone et bascule automatique) corrige ça, pour environ le double du prix de la base.
+- *Scaler sur le CPU quand c'est la base qui sature* : ajouter des conteneurs ouvre plus de connexions et empire la saturation de la base. Il faut scaler sur la latence ou les connexions, mettre un pool (RDS Proxy), des réplicas en lecture ou un cache.
+- *TTL CloudFront et délai d'un correctif* : une page corrigée n'apparaît qu'à expiration du TTL, sauf invalidation (`create-invalidation`) ou fichiers versionnés. TTL court = plus de requêtes vers l'origine, TTL long = correctifs plus lents.
+- *Lambda pour une charge constante ou mensuelle* : Lambda est idéal pour une charge rare ou en pics (on ne paie rien au repos, ex. un batch mensuel). Pour une charge constante 24/7, des conteneurs ou des instances réservées coûtent moins cher.
+- *Fan-out vers email et modération, message en double* : SNS vers plusieurs files SQS, une par consommateur. SNS/SQS livrent « au moins une fois » : chaque consommateur doit être idempotent (mémoriser les IDs de message déjà traités, ou file FIFO avec déduplication), sinon l'email part deux fois.
